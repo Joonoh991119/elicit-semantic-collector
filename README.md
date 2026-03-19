@@ -7,51 +7,9 @@ A personal research automation pipeline that turns a natural-language research q
 
 ## How It Works
 
-```
-                         ┌──────────────────┐
-                         │ Research Question │
-                         └────────┬─────────┘
-                                  │
-              ┌───────────────────▼────────────────────┐
-              │  Stage 1 — Elicit Semantic Search       │
-              │  POST /api/v1/search                    │
-              │  → ranked DOI list + metadata            │
-              │  → auto-filter JOV abstracts / no-DOI    │
-              └───────────────────┬────────────────────┘
-                                  │
-              ┌───────────────────▼────────────────────┐
-              │  Stage 2 — PDF Acquisition + Zotero     │
-              │                                         │
-              │  6-tier download strategy:               │
-              │   1. Unpaywall (all OA locations)        │
-              │   2. CrossRef direct PDF links           │
-              │   3. EuropePMC (PMCID → render)          │
-              │   4. Sci-Hub (sci-hub.kr mirror)         │
-              │   5. Publisher URL patterns               │
-              │   6. Playwright browser (Cloudflare      │
-              │      bypass with institutional login)     │
-              │                                         │
-              │  → Zotero Web API or SQLite backend      │
-              │  → subcollection auto-creation            │
-              │  → PDF attachment upload                  │
-              └───────────────────┬────────────────────┘
-                                  │
-                   ┌──────────────┴──────────────┐
-                   ▼                              ▼
-    ┌──────────────────────┐      ┌──────────────────────┐
-    │  Stage 3a — Memory    │      │  Stage 3b — Reports   │
-    │                       │      │   (on-demand)         │
-    │  PyMuPDF text extract │      │                       │
-    │  → chunk (512 words)  │      │  Elicit Reports API   │
-    │  → Nemotron embed     │      │  POST /api/v1/reports │
-    │  → ChromaDB store     │      │  → structured review  │
-    │                       │      │  → markdown export    │
-    │  Enables:             │      │                       │
-    │  · semantic search    │      │                       │
-    │  · paper clustering   │      │                       │
-    │  · similarity ranking │      │                       │
-    └──────────────────────┘      └──────────────────────┘
-```
+<p align="center">
+  <img src="docs/pipeline.png" alt="Meta-Researcher Pipeline" width="900">
+</p>
 
 ## Setup
 
