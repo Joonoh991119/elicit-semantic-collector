@@ -205,6 +205,61 @@ class ElicitReportsClient:
         raise TimeoutError(f"Report did not complete within {max_wait}s")
 
 
+# ─── Post-Search Filters ────────────────────────────────────
+# JOV abstract DOI patterns:
+#   10.1167/jov.XX.X.XXXX   (VSS meeting abstracts, 4-digit suffix)
+#   10.1167/XX.X.XXX         (short format, ≤3-digit suffix)
+# Full JOV papers have longer suffixes or different patterns.
+import re as _re
+
+_JOV_ABSTRACT_PATTERNS = [
+    _re.compile(r"^10\.1167/jov\.\d+\.\d+\.\d{2,5}$"),  # jov.21.9.2381
+    _re.compile(r"^10\.1167/\d+\.\d+\.\d{1,4}[a-z]?$"),  # 12.9.280, 19.10.142d
+]
+
+def is_jov_abstract(doi: str) -> bool:
+    """JOV conference abstract DOI인지 판별한다."""
+    if not doi or "10.1167/" not in doi:
+        return False
+    for pat in _JOV_ABSTRACT_PATTERNS:
+        if pat.match(doi):
+            return True
+    return False
+
+
+def filter_papers(
+    papers: list[dict],
+    exclude_jov_abstracts: bool = True,
+    min_citations: int = 0,
+    logger: logging.Logger | None = None,
+) -> list[dict]:
+    """Post-search 필터링: JOV abstracts, low-citation 제거."""
+    log = logger or logging.getLogger("stage1")
+    filtered = []
+    removed = {"jov_abstract": 0, "low_citation": 0, "no_doi": 0}
+
+    for p in papers:
+        doi = p.get("doi", "")
+        if not doi:
+            removed["no_doi"] += 1
+            continue
+        if exclude_jov_abstracts and is_jov_abstract(doi):
+            removed["jov_abstract"] += 1
+            continue
+        if min_citations > 0 and p.get("citedByCount", 0) < min_citations:
+            removed["low_citation"] += 1
+            continue
+        filtered.append(p)
+
+    if any(removed.values()):
+        log.info(f"  Filtered: {sum(removed.values())} removed "
+                 f"(JOV abstracts: {removed['jov_abstract']}, "
+                 f"low citation: {removed['low_citation']}, "
+                 f"no DOI: {removed['no_doi']})")
+
+    return filtered
+
+
 # ─── Output ─────────────────────────────────────────────────
 def save_results(
     papers: list[dict],
@@ -356,6 +411,17 @@ def run_stage1(
                 filters=filters,
                 logger=log,
             )
+
+            # Post-search filtering (JOV abstracts, no-DOI, etc.)
+            raw_count = len(papers)
+            papers = filter_papers(
+                papers,
+                exclude_jov_abstracts=True,
+                logger=log,
+            )
+            if raw_count != len(papers):
+                log.info(f"  {raw_count} → {len(papers)} after filtering")
+
             outfile = save_results(papers, query_text, collection, output_dir)
             log.info(f"  → {len(papers)} papers saved to {outfile}")
             print_summary(papers, query_text)

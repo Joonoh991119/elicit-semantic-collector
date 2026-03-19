@@ -83,26 +83,52 @@ def try_unpaywall(doi: str, dest: Path, email: str, timeout: int = 30) -> bool:
 
 
 # ─── Strategy 2: Sci-Hub ───────────────────────────────────
+def _scihub_session() -> requests.Session:
+    """Sci-Hub requires a clean session without extra Accept headers."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        ),
+    })
+    return s
+
+
+_SH_SESSION = _scihub_session()
+
+
 def try_scihub(
     doi: str, dest: Path, mirrors: list[str], timeout: int = 30
 ) -> bool:
-    """Try Sci-Hub mirrors for PDF."""
+    """Try Sci-Hub mirrors for PDF with comprehensive URL extraction."""
     for mirror in mirrors:
         try:
-            r = _SESSION.get(f"{mirror}/{doi}", timeout=timeout)
+            r = _SH_SESSION.get(f"{mirror}/{doi}", timeout=timeout)
             if r.status_code != 200:
                 continue
-            # Find PDF URL in iframe/embed or direct link
+
+            # Multiple PDF URL extraction patterns (ordered by reliability)
+            # Note: Sci-Hub HTML uses spaces around = in attributes (e.g. data = "url")
             patterns = [
-                r'(?:iframe|embed)[^>]*src=["\']([^"\']*\.pdf[^"\']*)["\']',
+                # <object data="/storage/.../paper.pdf"> (with optional spaces)
+                r'<object[^>]*data\s*=\s*["\']([^"\']*\.pdf[^"\']*)["\']',
+                # citation_pdf_url meta tag (with optional spaces)
+                r'citation_pdf_url["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
+                r'content\s*=\s*["\']([^"\']+\.pdf[^"\']*)["\'][^>]*citation_pdf_url',
+                # iframe/embed src
+                r'(?:iframe|embed)[^>]*src\s*=\s*["\']([^"\']*\.pdf[^"\']*)["\']',
+                # Direct PDF links
                 r'(https?://[^\s"\'<>]+\.pdf[^\s"\'<>]*)',
             ]
             for pat in patterns:
                 match = re.search(pat, r.text, re.I)
                 if match:
-                    url = match.group(1)
+                    url = match.group(1).split("#")[0]  # Remove URL fragment
                     if url.startswith("//"):
                         url = "https:" + url
+                    elif url.startswith("/"):
+                        url = mirror + url
                     if _download_file(url, dest, timeout):
                         return True
         except Exception:
