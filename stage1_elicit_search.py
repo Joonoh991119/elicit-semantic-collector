@@ -205,57 +205,134 @@ class ElicitReportsClient:
         raise TimeoutError(f"Report did not complete within {max_wait}s")
 
 
-# ─── Post-Search Filters ────────────────────────────────────
-# JOV abstract DOI patterns:
-#   10.1167/jov.XX.X.XXXX   (VSS meeting abstracts, 4-digit suffix)
-#   10.1167/XX.X.XXX         (short format, ≤3-digit suffix)
-# Full JOV papers have longer suffixes or different patterns.
+# ─── Full-Text Screening ────────────────────────────────────
+# Two-layer screening to remove abstract-only pages:
+#   Layer 1: DOI prefix pattern matching (fast, no API calls)
+#   Layer 2: Unpaywall url_for_pdf check (slow, batched)
 import re as _re
+import urllib.parse as _urlparse
 
-_JOV_ABSTRACT_PATTERNS = [
-    _re.compile(r"^10\.1167/jov\.\d+\.\d+\.\d{2,5}$"),  # jov.21.9.2381
+# Known abstract-only DOI patterns (conference abstracts, meeting posters)
+_ABSTRACT_DOI_PATTERNS = [
+    # JOV / VSS meeting abstracts
+    _re.compile(r"^10\.1167/jov\.\d+\.\d+\.\d{2,5}$"),   # jov.21.9.2381
     _re.compile(r"^10\.1167/\d+\.\d+\.\d{1,4}[a-z]?$"),  # 12.9.280, 19.10.142d
+    # SfN abstracts (Society for Neuroscience)
+    _re.compile(r"^10\.1523/.*abstract$", _re.I),
+    # ECVP / iPerception short abstracts
+    _re.compile(r"^10\.1177/20416695\d+s\d+$"),
 ]
 
-def is_jov_abstract(doi: str) -> bool:
-    """JOV conference abstract DOI인지 판별한다."""
-    if not doi or "10.1167/" not in doi:
+
+def is_likely_abstract(doi: str) -> bool:
+    """DOI 패턴만으로 abstract-only 여부를 추정한다 (Layer 1)."""
+    if not doi:
         return False
-    for pat in _JOV_ABSTRACT_PATTERNS:
+    for pat in _ABSTRACT_DOI_PATTERNS:
         if pat.match(doi):
             return True
     return False
 
 
+def check_fulltext_availability(
+    dois: list[str],
+    email: str = "",
+    logger: logging.Logger | None = None,
+) -> dict[str, bool]:
+    """
+    Unpaywall API로 full-text PDF 존재 여부를 확인한다 (Layer 2).
+    url_for_pdf가 있으면 True, 없으면 False.
+    API 호출을 최소화하기 위해 Layer 1 통과 후 남은 DOI에만 적용.
+    """
+    log = logger or logging.getLogger("stage1")
+    results = {}
+
+    for i, doi in enumerate(dois):
+        try:
+            encoded = _urlparse.quote(doi, safe="")
+            r = requests.get(
+                f"https://api.unpaywall.org/v2/{encoded}?email={email}",
+                timeout=10,
+            )
+            if r.status_code != 200:
+                results[doi] = True  # 확인 불가 → 보수적으로 유지
+                continue
+            data = r.json()
+            locs = data.get("oa_locations", [])
+            has_pdf = any(
+                loc.get("url_for_pdf") for loc in locs if loc
+            )
+            # Non-OA papers도 유지 (Sci-Hub/browser fallback 가능)
+            # OA인데 PDF가 없으면 abstract-only 가능성 높음
+            is_oa = data.get("is_oa", False)
+            if is_oa and not has_pdf and not data.get("has_repository_copy"):
+                results[doi] = False  # OA인데 PDF 없음 → abstract-only
+            else:
+                results[doi] = True
+        except Exception:
+            results[doi] = True  # 에러 시 보수적으로 유지
+
+        if (i + 1) % 20 == 0:
+            log.info(f"    Fulltext check: {i+1}/{len(dois)}")
+        time.sleep(0.1)  # Unpaywall rate limit
+
+    return results
+
+
 def filter_papers(
     papers: list[dict],
-    exclude_jov_abstracts: bool = True,
+    email: str = "",
+    screen_fulltext: bool = True,
     min_citations: int = 0,
     logger: logging.Logger | None = None,
 ) -> list[dict]:
-    """Post-search 필터링: JOV abstracts, low-citation 제거."""
+    """
+    Two-layer screening:
+      Layer 1: DOI pattern → remove known abstract DOI patterns (fast)
+      Layer 2: Unpaywall → remove OA papers without any PDF URL (slower)
+    """
     log = logger or logging.getLogger("stage1")
-    filtered = []
-    removed = {"jov_abstract": 0, "low_citation": 0, "no_doi": 0}
+    removed = {"no_doi": 0, "doi_pattern": 0, "no_fulltext": 0, "low_citation": 0}
 
+    # Layer 1: Remove no-DOI + known abstract patterns
+    after_layer1 = []
     for p in papers:
         doi = p.get("doi", "")
         if not doi:
             removed["no_doi"] += 1
             continue
-        if exclude_jov_abstracts and is_jov_abstract(doi):
-            removed["jov_abstract"] += 1
+        if is_likely_abstract(doi):
+            removed["doi_pattern"] += 1
             continue
         if min_citations > 0 and p.get("citedByCount", 0) < min_citations:
             removed["low_citation"] += 1
             continue
-        filtered.append(p)
+        after_layer1.append(p)
 
-    if any(removed.values()):
-        log.info(f"  Filtered: {sum(removed.values())} removed "
-                 f"(JOV abstracts: {removed['jov_abstract']}, "
-                 f"low citation: {removed['low_citation']}, "
-                 f"no DOI: {removed['no_doi']})")
+    # Layer 2: Unpaywall fulltext check on remaining papers
+    if screen_fulltext and email:
+        dois_to_check = [p["doi"] for p in after_layer1]
+        log.info(f"  Layer 2: Checking fulltext availability for {len(dois_to_check)} papers...")
+        fulltext_map = check_fulltext_availability(dois_to_check, email, log)
+
+        filtered = []
+        for p in after_layer1:
+            if fulltext_map.get(p["doi"], True):
+                filtered.append(p)
+            else:
+                removed["no_fulltext"] += 1
+    else:
+        filtered = after_layer1
+
+    total_removed = sum(removed.values())
+    if total_removed:
+        log.info(
+            f"  Screening: {total_removed} removed "
+            f"(no DOI: {removed['no_doi']}, "
+            f"abstract pattern: {removed['doi_pattern']}, "
+            f"no fulltext: {removed['no_fulltext']}, "
+            f"low citation: {removed['low_citation']})"
+        )
 
     return filtered
 
@@ -412,11 +489,12 @@ def run_stage1(
                 logger=log,
             )
 
-            # Post-search filtering (JOV abstracts, no-DOI, etc.)
+            # Two-layer fulltext screening
             raw_count = len(papers)
             papers = filter_papers(
                 papers,
-                exclude_jov_abstracts=True,
+                email=cfg.get("email", ""),
+                screen_fulltext=True,
                 logger=log,
             )
             if raw_count != len(papers):
